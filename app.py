@@ -26,6 +26,14 @@ WEBHOOK_URL_DEFAULT = "https://hook.eu2.make.com/k9fkxrsr1xf9979ouo7yg1kgjv6fap6
 WEBHOOK_TIMEOUT = 15
 WEBHOOK_RETRIES = 3
 
+# Branding. The logo is found by name, so the extension does not matter
+# (.png / .svg / .jpg all work) and it can sit either next to app.py or in an
+# assets/ subfolder.
+LOGO_STEM = "new digipanda logo-02"
+LOGO_EXTS = (".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif")
+LOGO_DIRS = (".", "assets")
+LOGO_INK_COLOR = "#1f2933"
+
 # Column headers kept EXACTLY as requested (including the odd spacing) so the
 # CSV and the webhook payload map 1:1 onto your existing sheet.
 COLUMNS = [
@@ -230,6 +238,85 @@ def next_invoice_no(prefix: str, d: dt.date, reset_each_fy: bool = False) -> str
 
 
 # ----------------------------------------------------------------------------
+# BRANDING
+# ----------------------------------------------------------------------------
+
+def find_logo() -> str | None:
+    """Locate the logo file without caring about its extension or casing."""
+    # 1. exact stem + known extension
+    for folder in LOGO_DIRS:
+        for ext in LOGO_EXTS:
+            candidate = os.path.join(folder, LOGO_STEM + ext)
+            if os.path.exists(candidate):
+                return candidate
+
+    # 2. same stem but different casing / stray spaces
+    target = LOGO_STEM.replace(" ", "").lower()
+    for folder in LOGO_DIRS:
+        if not os.path.isdir(folder):
+            continue
+        for name in sorted(os.listdir(folder)):
+            stem, ext = os.path.splitext(name)
+            if ext.lower() in LOGO_EXTS and stem.replace(" ", "").lower() == target:
+                return os.path.join(folder, name)
+
+    # 3. last resort: anything with "logo" in the filename
+    for folder in LOGO_DIRS:
+        if not os.path.isdir(folder):
+            continue
+        for name in sorted(os.listdir(folder)):
+            stem, ext = os.path.splitext(name)
+            if ext.lower() in LOGO_EXTS and "logo" in stem.lower():
+                return os.path.join(folder, name)
+    return None
+
+
+def ink_variant(svg_path: str) -> str | None:
+    """A white logo is invisible on a light background. For SVGs we can fix
+    that automatically by recolouring the fills; returns None if the artwork
+    was not white to begin with (or is not an SVG)."""
+    if not svg_path.lower().endswith(".svg"):
+        return None
+
+    out_path = f"{os.path.splitext(svg_path)[0]}-ink.svg"
+    if os.path.exists(out_path) and os.path.getmtime(out_path) >= os.path.getmtime(svg_path):
+        return out_path
+
+    try:
+        with open(svg_path, encoding="utf-8") as fh:
+            svg = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    whites = ('"#fff"', '"#ffffff"', '"#FFF"', '"#FFFFFF"', '"white"')
+    if not any(f"fill={w}" in svg for w in whites):
+        return None  # already dark, nothing to do
+
+    for white in whites:
+        svg = svg.replace(f"fill={white}", f'fill="{LOGO_INK_COLOR}"')
+    try:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(svg)
+    except OSError:
+        return None
+    return out_path
+
+
+def resolve_logo() -> str | None:
+    """The file to render: white original on dark themes, ink copy on light."""
+    logo = find_logo()
+    if not logo:
+        return None
+    try:
+        is_dark = st.context.theme.type == "dark"
+    except Exception:  # noqa: BLE001 - older Streamlit lacks st.context.theme
+        is_dark = False
+    if is_dark:
+        return logo
+    return ink_variant(logo) or logo
+
+
+# ----------------------------------------------------------------------------
 # WEBHOOK DELIVERY
 # ----------------------------------------------------------------------------
 
@@ -324,8 +411,27 @@ def flush_pending(url: str) -> tuple[int, int]:
 # UI
 # ----------------------------------------------------------------------------
 
-st.set_page_config(page_title="Invoice Data Entry", page_icon="🧾", layout="wide")
+# find_logo() and ink_variant() are pure file IO, so they are safe to run
+# before set_page_config(), which must be the first Streamlit command.
+_logo_file = find_logo()
+_favicon = (ink_variant(_logo_file) or _logo_file) if _logo_file else "🧾"
+
+st.set_page_config(
+    page_title="Invoice Data Entry",
+    page_icon=_favicon,
+    layout="wide",
+)
 ensure_store()
+
+BRAND_LOGO = resolve_logo()
+if BRAND_LOGO:
+    # Pinned to the top-left, above the sidebar. Stays visible on every tab and
+    # even when the sidebar is collapsed.
+    st.logo(BRAND_LOGO, size="large")
+else:
+    st.sidebar.warning(
+        f'Logo not found. Put "{LOGO_STEM}.png" (or .svg) next to app.py.'
+    )
 
 with st.sidebar:
     st.header("Settings")
@@ -336,7 +442,7 @@ with st.sidebar:
         help="Same state as client -> CGST + SGST. Different state -> IGST.",
     )
     gst_rate = st.number_input("GST rate (%)", 0.0, 28.0, 18.0, step=0.5)
-    inv_prefix = st.text_input("Invoice prefix", value="DPC")
+    inv_prefix = st.text_input("Invoice prefix", value="DP")
     reset_each_fy = st.toggle(
         "Restart numbering each financial year",
         value=False,
@@ -371,7 +477,7 @@ with st.sidebar:
             st.success(f"Sent {sent}." + (f" {failed} still failing." if failed else ""))
             st.rerun()
 
-st.title("🧾 Invoice Data Entry")
+st.title("Invoice Data Entry")
 
 tab_entry, tab_records = st.tabs(["New entry", "Records"])
 
@@ -409,13 +515,14 @@ with tab_entry:
                 st.session_state["_advance_invoice"] = True
                 st.rerun()
     with c3:
-        email = st.text_input("Your Email Id", placeholder="you@company.com")
+        email = st.text_input("Your Email Id *", placeholder="you@company.com")
 
-    st.subheader("Client details")
+    st.subheader("Billing details")
+    st.caption("Fields marked * are mandatory.")
     c1, c2 = st.columns([2, 1])
     with c1:
-        client_name = st.text_input("Client Name")
-        client_address = st.text_area("Client Address", height=100)
+        billing_name = st.text_input("Billing name *")
+        billing_address = st.text_area("Billing address *", height=100)
     with c2:
         state = st.selectbox("State (place of supply)", STATES, index=STATES.index("Haryana"))
         gst_code = STATE_CODES[state]
@@ -426,16 +533,16 @@ with tab_entry:
             help="Filled automatically from the selected state.",
         )
         client_gst = st.text_input(
-            "Client GST",
+            "Client GST *",
             placeholder=f"{gst_code}ABCDE1234F1Z5",
-            help="Leave blank if unregistered",
+            help="Mandatory. 15-character GSTIN.",
         ).strip().upper()
 
     st.subheader("Line items")
     l1, l2 = st.columns(2)
     with l1:
         st.markdown("**Item 1**")
-        service_1 = st.text_input("Service_1")
+        service_1 = st.text_input("Service_1 *")
         desc_1 = st.text_area("Discription_1", height=90, key="d1")
         amount_1 = st.number_input("Amount_1", min_value=0.0, step=500.0, format="%.2f")
     with l2:
@@ -469,8 +576,10 @@ with tab_entry:
 
     # ---- validation ----
     errors, warnings = [], []
-    if not client_name.strip():
-        errors.append("Client Name is required.")
+    if not billing_name.strip():
+        errors.append("Billing name is required.")
+    if not billing_address.strip():
+        errors.append("Billing address is required.")
     if not invoice_no.strip():
         errors.append("Invoice No is required.")
     else:
@@ -486,16 +595,19 @@ with tab_entry:
         errors.append("Enter at least one amount greater than 0.")
     if not service_1.strip():
         errors.append("Service_1 is required.")
-    if email and not EMAIL_RE.match(email.strip()):
+    if not email.strip():
+        errors.append("Your Email Id is required.")
+    elif not EMAIL_RE.match(email.strip()):
         errors.append("Email Id looks invalid.")
-    if client_gst:
-        if not GSTIN_RE.match(client_gst):
-            errors.append("Client GST is not a valid 15-character GSTIN.")
-        elif client_gst[:2] != gst_code:
-            warnings.append(
-                f"GSTIN starts with {client_gst[:2]} but {state} is code "
-                f"{gst_code}. Check the state."
-            )
+    if not client_gst:
+        errors.append("Client GST is required.")
+    elif not GSTIN_RE.match(client_gst):
+        errors.append("Client GST is not a valid 15-character GSTIN.")
+    elif client_gst[:2] != gst_code:
+        warnings.append(
+            f"GSTIN starts with {client_gst[:2]} but {state} is code "
+            f"{gst_code}. Check the state."
+        )
 
     for w in warnings:
         st.warning(w)
@@ -509,8 +621,8 @@ with tab_entry:
                 "Timestamp": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "Date": inv_date.strftime("%d-%m-%Y"),
                 "Invoice_No": invoice_no.strip(),
-                "Client_Name": client_name.strip(),
-                "Client_Address": client_address.strip().replace("\n", ", "),
+                "Client_Name": billing_name.strip(),
+                "Client_Address": billing_address.strip().replace("\n", ", "),
                 "Client_GST": client_gst,
                 "State": state,
                 "GST_Code": gst_code,
@@ -554,25 +666,62 @@ with tab_records:
     if df.empty:
         st.info("No invoices saved yet.")
     else:
-        left, right = st.columns([3, 1])
-        with left:
-            q = st.text_input("Search client / invoice no")
+        # Split the stored Timestamp into readable date and time columns for
+        # display. Timestamp itself stays untouched in the CSV and the webhook.
+        ts = pd.to_datetime(df["Timestamp"], errors="coerce")
+        df = df.assign(
+            **{
+                "Created Date": ts.dt.strftime("%d-%m-%Y").fillna(""),
+                "Created Time": ts.dt.strftime("%I:%M:%S %p").fillna(""),
+            }
+        )
+
+        first_cols = ["Created Date", "Created Time", "Invoice_No", "Client_Name"]
+        ordered = first_cols + [c for c in df.columns if c not in first_cols]
+
+        q = st.text_input("Search billing name / invoice no / GST")
         view = df
         if q:
             mask = (
                 df["Client_Name"].str.contains(q, case=False, na=False)
                 | df["Invoice_No"].str.contains(q, case=False, na=False)
+                | df["Client_GST"].str.contains(q, case=False, na=False)
             )
             view = df[mask]
-        with right:
-            st.metric("Invoices", len(view))
-            billed = pd.to_numeric(view["total_amount+ gst"], errors="coerce").sum()
-            st.metric("Total billed", f"₹ {billed:,.0f}")
 
-        st.dataframe(view.iloc[::-1], width="stretch", hide_index=True)
+        # Newest first by actual creation time, not by file order (rows can be
+        # appended out of order if the CSV is ever edited by hand).
+        view = view.assign(_ts=ts.reindex(view.index)).sort_values(
+            "_ts", ascending=False, na_position="last", kind="stable"
+        ).drop(columns="_ts")
+
+        m1, m2, m3, m4 = st.columns(4)
+        billed = pd.to_numeric(view["total_amount+ gst"], errors="coerce").sum()
+        gst_collected = pd.to_numeric(view["gst"], errors="coerce").sum()
+        m1.metric("Invoices shown", f"{len(view)} of {len(df)}")
+        m2.metric("Total billed", f"₹ {billed:,.0f}")
+        m3.metric("GST collected", f"₹ {gst_collected:,.0f}")
+        valid_ts = ts.dropna()
+        m4.metric(
+            "First entry",
+            valid_ts.min().strftime("%d-%m-%Y") if not valid_ts.empty else "—",
+        )
+
+        st.dataframe(
+            view[ordered],
+            width="stretch",
+            height=520,
+            hide_index=True,
+        )
         st.download_button(
-            "⬇️ Download CSV",
-            data=view.to_csv(index=False).encode("utf-8"),
-            file_name="invoices.csv",
+            "⬇️ Download all records (CSV)",
+            data=df[ordered]
+            .assign(_ts=ts)
+            .sort_values("_ts", ascending=False, na_position="last", kind="stable")
+            .drop(columns="_ts")
+            .to_csv(index=False)
+            .encode("utf-8"),
+            file_name=f"invoices_{dt.date.today():%Y%m%d}.csv",
             mime="text/csv",
+            help="Every record ever saved, not just the filtered view.",
         )
