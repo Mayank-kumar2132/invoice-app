@@ -82,6 +82,34 @@ STATES = sorted(STATE_CODES.keys())
 GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
 EMAIL_RE = re.compile(r"^[\w\.\+\-]+@[\w\-]+\.[\w\.\-]+$")
 
+TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# Timestamps are pinned to IST rather than the machine clock, so the recorded
+# time is right whether this runs on your laptop or on a UTC cloud host.
+# Windows ships no tz database, so fall back to a fixed +05:30 offset if the
+# optional `tzdata` package is not installed.
+try:
+    from zoneinfo import ZoneInfo
+
+    IST = ZoneInfo("Asia/Kolkata")
+except Exception:  # noqa: BLE001 - ZoneInfoNotFoundError, ImportError
+    IST = dt.timezone(dt.timedelta(hours=5, minutes=30), "IST")
+
+
+def now_ist() -> dt.datetime:
+    return dt.datetime.now(IST)
+
+
+def parse_timestamps(series: pd.Series) -> pd.Series:
+    """Parse the Timestamp column, tolerating rows written by older versions."""
+    parsed = pd.to_datetime(series, format=TS_FORMAT, errors="coerce")
+    missing = parsed.isna() & series.astype(str).str.strip().ne("")
+    if missing.any():
+        parsed.loc[missing] = pd.to_datetime(
+            series[missing], errors="coerce", dayfirst=True
+        )
+    return parsed
+
 
 # ----------------------------------------------------------------------------
 # NUMBER -> INDIAN WORDS
@@ -189,12 +217,45 @@ def load_data() -> pd.DataFrame:
         return pd.DataFrame(columns=COLUMNS)
 
 
+def one_line(value: str) -> str:
+    """Collapse newlines and tabs so one record is always one line in the CSV.
+
+    Embedded newlines are legal CSV, but they break the moment anything other
+    than pandas touches the file (Excel, Notepad, a OneDrive conflict merge, a
+    naive line-by-line reader), which silently loses or splits records.
+    """
+    return re.sub(r"\s*[\r\n\t]+\s*", ", ", str(value)).strip().strip(",").strip()
+
+
 def append_row(row: dict) -> None:
+    """Append one record, then confirm it is really on disk.
+
+    A silent write failure - file locked by Excel, OneDrive mid-sync, no disk
+    permission - would otherwise look like a successful save while the record
+    vanishes.
+    """
     ensure_store()
-    pd.DataFrame([row], columns=COLUMNS).to_csv(
-        CSV_PATH, mode="a", header=False, index=False
-    )
+    clean = {c: one_line(row.get(c, "")) for c in COLUMNS}
+
+    try:
+        pd.DataFrame([clean], columns=COLUMNS).to_csv(
+            CSV_PATH, mode="a", header=False, index=False
+        )
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Cannot write {CSV_PATH} - it is open in another program "
+            f"(Excel?). Close it and save again. ({exc})"
+        ) from exc
+
     load_data.clear()
+
+    check = pd.read_csv(CSV_PATH, dtype=str).fillna("")
+    if clean["Invoice_No"] not in set(check["Invoice_No"].astype(str).str.strip()):
+        raise RuntimeError(
+            f"{clean['Invoice_No']} did not persist to {CSV_PATH}. "
+            "If this folder is inside OneDrive or Dropbox, move the project to "
+            "a local path such as C:\\dev\\invoice-app."
+        )
 
 
 def fy_label(d: dt.date) -> str:
@@ -618,11 +679,11 @@ with tab_entry:
                 st.error(e)
         else:
             row = {
-                "Timestamp": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Timestamp": now_ist().strftime(TS_FORMAT),
                 "Date": inv_date.strftime("%d-%m-%Y"),
                 "Invoice_No": invoice_no.strip(),
                 "Client_Name": billing_name.strip(),
-                "Client_Address": billing_address.strip().replace("\n", ", "),
+                "Client_Address": billing_address.strip(),
                 "Client_GST": client_gst,
                 "State": state,
                 "GST_Code": gst_code,
@@ -638,7 +699,11 @@ with tab_entry:
                 "Final Amount in words ": words,
                 "Your Email Id": email.strip(),
             }
-            append_row(row)
+            try:
+                append_row(row)
+            except RuntimeError as exc:
+                st.error(str(exc))
+                st.stop()
             msgs = [f"Saved **{row['Invoice_No']}** for {row['Client_Name']}."]
 
             if send_webhook:
@@ -668,18 +733,33 @@ with tab_records:
     else:
         # Split the stored Timestamp into readable date and time columns for
         # display. Timestamp itself stays untouched in the CSV and the webhook.
-        ts = pd.to_datetime(df["Timestamp"], errors="coerce")
+        df = df.reset_index(drop=True)
+        ts = parse_timestamps(df["Timestamp"])
         df = df.assign(
             **{
                 "Created Date": ts.dt.strftime("%d-%m-%Y").fillna(""),
-                "Created Time": ts.dt.strftime("%I:%M:%S %p").fillna(""),
+                "Created Time": ts.dt.strftime("%H:%M:%S").fillna(""),
+                "_ts": ts,
+                # Position in the file breaks ties when several invoices share
+                # the same second, so the genuinely newest row stays on top.
+                "_pos": range(len(df)),
             }
         )
 
         first_cols = ["Created Date", "Created Time", "Invoice_No", "Client_Name"]
-        ordered = first_cols + [c for c in df.columns if c not in first_cols]
+        hidden = {"_ts", "_pos"}
+        ordered = first_cols + [
+            c for c in df.columns if c not in first_cols and c not in hidden
+        ]
 
-        q = st.text_input("Search billing name / invoice no / GST")
+        top = st.columns([4, 1], vertical_alignment="bottom")
+        with top[0]:
+            q = st.text_input("Search billing name / invoice no / GST")
+        with top[1]:
+            if st.button("↻ Refresh", width="stretch"):
+                load_data.clear()
+                st.rerun()
+
         view = df
         if q:
             mask = (
@@ -689,11 +769,11 @@ with tab_records:
             )
             view = df[mask]
 
-        # Newest first by actual creation time, not by file order (rows can be
-        # appended out of order if the CSV is ever edited by hand).
-        view = view.assign(_ts=ts.reindex(view.index)).sort_values(
-            "_ts", ascending=False, na_position="last", kind="stable"
-        ).drop(columns="_ts")
+        # Newest first: by creation time, then by file position for same-second
+        # saves. Rows with an unparseable Timestamp sink to the bottom.
+        view = view.sort_values(
+            ["_ts", "_pos"], ascending=[False, False], na_position="last"
+        )
 
         m1, m2, m3, m4 = st.columns(4)
         billed = pd.to_numeric(view["total_amount+ gst"], errors="coerce").sum()
@@ -701,7 +781,7 @@ with tab_records:
         m1.metric("Invoices shown", f"{len(view)} of {len(df)}")
         m2.metric("Total billed", f"₹ {billed:,.0f}")
         m3.metric("GST collected", f"₹ {gst_collected:,.0f}")
-        valid_ts = ts.dropna()
+        valid_ts = df["_ts"].dropna()
         m4.metric(
             "First entry",
             valid_ts.min().strftime("%d-%m-%Y") if not valid_ts.empty else "—",
@@ -715,13 +795,38 @@ with tab_records:
         )
         st.download_button(
             "⬇️ Download all records (CSV)",
-            data=df[ordered]
-            .assign(_ts=ts)
-            .sort_values("_ts", ascending=False, na_position="last", kind="stable")
-            .drop(columns="_ts")
+            data=df.sort_values(["_ts", "_pos"], ascending=[False, False],
+                                na_position="last")[ordered]
             .to_csv(index=False)
             .encode("utf-8"),
             file_name=f"invoices_{dt.date.today():%Y%m%d}.csv",
             mime="text/csv",
             help="Every record ever saved, not just the filtered view.",
         )
+
+        with st.expander("Storage check"):
+            physical = sum(1 for _ in open(CSV_PATH, encoding="utf-8")) - 1
+            st.write(
+                {
+                    "file": os.path.abspath(CSV_PATH),
+                    "records parsed": len(df),
+                    "data lines in file": physical,
+                    "unparseable timestamps": int(df["_ts"].isna().sum()),
+                }
+            )
+            if physical != len(df):
+                st.warning(
+                    "Line count does not match record count — the CSV was "
+                    "probably edited outside this app."
+                )
+            conflicts = [
+                f for f in os.listdir(DATA_DIR)
+                if f.startswith("invoices") and f != os.path.basename(CSV_PATH)
+            ]
+            if conflicts:
+                st.error(
+                    "Sync conflict copies found in data/: "
+                    + ", ".join(conflicts)
+                    + ". Records may have been split across them. Move this "
+                    "project out of OneDrive."
+                )
