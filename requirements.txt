@@ -1,0 +1,6 @@
+streamlit>=1.36
+pandas>=2.0
+
+# Optional: only needed if you enable the Google Sheets toggle
+# gspread>=6.0
+# google-auth>=2.30
