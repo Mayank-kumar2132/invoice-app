@@ -43,6 +43,8 @@ COLUMNS = [
     "Service_2", "Discription_2", "Amount_2",
     "total_amount", "gst", "total_amount+ gst",
     "Final Amount in words ", "Your Email Id",
+    # Appended at the end so existing column positions do not shift.
+    "HSN_1", "HSN_2",
 ]
 
 # State -> GST state code. Stored zero-padded ("06", not "6") because that is
@@ -78,6 +80,69 @@ STATE_CODES = {
     "West Bengal": "19",
 }
 STATES = sorted(STATE_CODES.keys())
+
+# Service catalogue. Each category carries its SAC code, so picking a service
+# fills HSN/SAC automatically.
+#
+# SAC codes for Social and ORM were not in the list you supplied - both are
+# defaulted to 998361 (advertising services). The HSN/SAC field stays editable
+# on every line, so confirm these two with your CA and override if needed.
+NO_SERVICE = "— none —"
+
+SERVICE_CATALOG = {
+    "Website Development": {
+        "sac": "998313",
+        "options": [
+            "Website development",
+            "Website design - UI/UX only",
+            "Website revamp",
+            "Website changes",
+        ],
+    },
+    "Performance Marketing": {
+        "sac": "998361",
+        "options": [
+            "Meta ads",
+            "Google ads",
+            "Meta and Google",
+            "LinkedIn",
+            "Meta, Google and LinkedIn",
+            "Google and LinkedIn",
+        ],
+    },
+    "GEO Services": {
+        "sac": "998313",
+        "options": [
+            "GEO - Launchpad",
+            "GEO - Ascend",
+            "GEO - Dominate",
+        ],
+    },
+    "Social Media": {
+        "sac": "998361",
+        "options": [
+            "SMM with shoots",
+            "SMM without shoots",
+        ],
+    },
+    "ORM": {
+        "sac": "998361",
+        "options": [
+            "ORM - custom, platform wise",
+            "ORM - Reddit and Quora",
+        ],
+    },
+    "AI Voice Agent": {
+        "sac": "998311",
+        "options": ["AI Voice Agent - Svaarico"],
+    },
+    "AI Automation": {
+        "sac": "998311",
+        "options": ["AI Automation"],
+    },
+}
+
+CATEGORIES = list(SERVICE_CATALOG.keys())
 
 GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
 EMAIL_RE = re.compile(r"^[\w\.\+\-]+@[\w\-]+\.[\w\.\-]+$")
@@ -390,7 +455,7 @@ def build_payload(row: dict, gst_rate: float, intra: bool, gst_amount: float) ->
     """
     half = round(gst_amount / 2, 2)
     return {
-        **{k: str(v) for k, v in row.items()},
+        **{k: str(v) for k, v in row.items() if not k.startswith("_")},
         "meta": {
             "gst_rate": gst_rate,
             "supply_type": "Intra-state" if intra else "Inter-state",
@@ -398,6 +463,8 @@ def build_payload(row: dict, gst_rate: float, intra: bool, gst_amount: float) ->
             "sgst": f"{gst_amount - half:.2f}" if intra else "0.00",
             "igst": "0.00" if intra else f"{gst_amount:.2f}",
             "source": "streamlit-invoice-app",
+            "category_1": row.get("_cat_1", ""),
+            "category_2": row.get("_cat_2", ""),
         },
     }
 
@@ -543,10 +610,8 @@ st.title("Invoice Data Entry")
 tab_entry, tab_records = st.tabs(["New entry", "Records"])
 
 with tab_entry:
-    # Runs before any widget is created, so it is safe to write the invoice
-    # field's session state here. Setting a widget's value after the widget has
-    # been instantiated in the same run raises a StreamlitAPIException, hence
-    # the flag-then-rerun pattern.
+    # Anything that writes widget state must run before those widgets exist,
+    # hence the flag-then-rerun pattern used throughout this block.
     if st.session_state.pop("_advance_invoice", False):
         ref_date = st.session_state.get("inv_date", dt.date.today())
         st.session_state["invoice_no"] = next_invoice_no(
@@ -603,14 +668,59 @@ with tab_entry:
     l1, l2 = st.columns(2)
     with l1:
         st.markdown("**Item 1**")
-        service_1 = st.text_input("Service_1 *")
+        cat_1 = st.selectbox("Category *", CATEGORIES, key="cat_1")
+        service_1 = st.selectbox(
+            "Service_1 *", SERVICE_CATALOG[cat_1]["options"], key="svc_1"
+        )
         desc_1 = st.text_area("Discription_1", height=90, key="d1")
         amount_1 = st.number_input("Amount_1", min_value=0.0, step=500.0, format="%.2f")
     with l2:
         st.markdown("**Item 2** *(optional)*")
-        service_2 = st.text_input("Service_2")
-        desc_2 = st.text_area("Discription_2", height=90, key="d2")
-        amount_2 = st.number_input("Amount_2", min_value=0.0, step=500.0, format="%.2f")
+        cat_2 = st.selectbox("Category", [NO_SERVICE] + CATEGORIES, key="cat_2")
+        if cat_2 == NO_SERVICE:
+            service_2 = ""
+            st.selectbox("Service_2", ["—"], disabled=True, key="svc_2_off")
+            desc_2 = ""
+            st.text_area("Discription_2", value="", height=90, disabled=True,
+                         key="d2_off")
+            amount_2 = 0.0
+            st.number_input("Amount_2", value=0.0, disabled=True, key="amt_2_off",
+                            format="%.2f")
+        else:
+            service_2 = st.selectbox(
+                "Service_2", SERVICE_CATALOG[cat_2]["options"], key="svc_2"
+            )
+            desc_2 = st.text_area("Discription_2", height=90, key="d2")
+            amount_2 = st.number_input(
+                "Amount_2", min_value=0.0, step=500.0, format="%.2f"
+            )
+
+    # ---- HSN / SAC, derived from the chosen category ----
+    st.subheader("HSN / SAC")
+    st.caption(
+        "Filled automatically from the service category. Edit if a particular "
+        "invoice needs a different code."
+    )
+    h1, h2 = st.columns(2)
+    with h1:
+        hsn_1 = st.text_input(
+            f"HSN/SAC — Item 1 ({cat_1})",
+            value=SERVICE_CATALOG[cat_1]["sac"],
+            key=f"hsn_1_{cat_1}",  # key includes the category so it refreshes
+            max_chars=8,
+        ).strip()
+    with h2:
+        if cat_2 == NO_SERVICE:
+            hsn_2 = ""
+            st.text_input("HSN/SAC — Item 2", value="", disabled=True,
+                          key="hsn_2_off")
+        else:
+            hsn_2 = st.text_input(
+                f"HSN/SAC — Item 2 ({cat_2})",
+                value=SERVICE_CATALOG[cat_2]["sac"],
+                key=f"hsn_2_{cat_2}",
+                max_chars=8,
+            ).strip()
 
     # ---- live calculation ----
     total_amount = round(amount_1 + amount_2, 2)
@@ -654,8 +764,16 @@ with tab_entry:
             )
     if total_amount <= 0:
         errors.append("Enter at least one amount greater than 0.")
-    if not service_1.strip():
-        errors.append("Service_1 is required.")
+    if not hsn_1 or not hsn_1.isdigit():
+        errors.append("HSN/SAC for Item 1 must be numeric.")
+    if cat_2 != NO_SERVICE:
+        if amount_2 <= 0:
+            errors.append(
+                f"Item 2 is set to '{service_2}' but Amount_2 is 0. "
+                "Set an amount or switch Category back to none."
+            )
+        if not hsn_2 or not hsn_2.isdigit():
+            errors.append("HSN/SAC for Item 2 must be numeric.")
     if not email.strip():
         errors.append("Your Email Id is required.")
     elif not EMAIL_RE.match(email.strip()):
@@ -688,9 +806,11 @@ with tab_entry:
                 "State": state,
                 "GST_Code": gst_code,
                 "Service_1": service_1.strip(),
+                "HSN_1": hsn_1,
                 "Discription_1": desc_1.strip(),
                 "Amount_1": f"{amount_1:.2f}",
                 "Service_2": service_2.strip(),
+                "HSN_2": hsn_2,
                 "Discription_2": desc_2.strip(),
                 "Amount_2": f"{amount_2:.2f}",
                 "total_amount": f"{total_amount:.2f}",
@@ -707,7 +827,11 @@ with tab_entry:
             msgs = [f"Saved **{row['Invoice_No']}** for {row['Client_Name']}."]
 
             if send_webhook:
-                payload = build_payload(row, gst_rate, intra, gst_amount)
+                payload = build_payload(
+                    {**row, "_cat_1": cat_1,
+                     "_cat_2": "" if cat_2 == NO_SERVICE else cat_2},
+                    gst_rate, intra, gst_amount,
+                )
                 ok, detail = post_webhook(webhook_url, payload)
                 if ok:
                     msgs.append(f"Sent to webhook ({detail}).")
@@ -793,6 +917,7 @@ with tab_records:
             height=520,
             hide_index=True,
         )
+
         st.download_button(
             "⬇️ Download all records (CSV)",
             data=df.sort_values(["_ts", "_pos"], ascending=[False, False],
@@ -830,3 +955,4 @@ with tab_records:
                     + ". Records may have been split across them. Move this "
                     "project out of OneDrive."
                 )
+                
