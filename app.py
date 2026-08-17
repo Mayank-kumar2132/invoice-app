@@ -18,7 +18,12 @@ import streamlit as st
 # CONFIG
 # ----------------------------------------------------------------------------
 
-DATA_DIR = "data"
+# Anchored to app.py's own folder, NOT the working directory. With a plain
+# relative "data" path the CSV lands wherever the terminal happened to be when
+# `streamlit run` was typed, so launching from a different folder silently
+# starts a fresh, empty history.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 CSV_PATH = os.path.join(DATA_DIR, "invoices.csv")
 PENDING_PATH = os.path.join(DATA_DIR, "webhook_pending.jsonl")
 
@@ -31,7 +36,7 @@ WEBHOOK_RETRIES = 3
 # assets/ subfolder.
 LOGO_STEM = "new digipanda logo-02"
 LOGO_EXTS = (".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif")
-LOGO_DIRS = (".", "assets")
+LOGO_DIRS = (BASE_DIR, os.path.join(BASE_DIR, "assets"))
 LOGO_INK_COLOR = "#1f2933"
 
 # Column headers kept EXACTLY as requested (including the odd spacing) so the
@@ -353,14 +358,21 @@ def last_sequence(prefix: str = "", fy: str = "") -> int:
     return seq
 
 
-def next_invoice_no(prefix: str, d: dt.date, reset_each_fy: bool = False) -> str:
-    """Always one higher than the last invoice saved. Never reuses a number."""
+def next_invoice_no(
+    prefix: str, d: dt.date, reset_each_fy: bool = False, min_seq: int = 0
+) -> str:
+    """Always one higher than the last invoice saved. Never reuses a number.
+
+    `min_seq` is a floor for hosts with throwaway storage (Streamlit Cloud
+    wipes the disk on every restart, so the local CSV cannot be trusted to
+    remember how far the numbering got).
+    """
     fy = fy_label(d)
     if reset_each_fy:
         seq = last_sequence(prefix, fy)
     else:
         seq = last_sequence()
-    return f"{prefix}/{fy}/{seq + 1:03d}"
+    return f"{prefix}/{fy}/{max(seq, min_seq) + 1:03d}"
 
 
 # ----------------------------------------------------------------------------
@@ -563,6 +575,15 @@ else:
 
 with st.sidebar:
     st.header("Settings")
+
+    # Always visible, so "my records vanished" is answerable at a glance.
+    _saved = load_data()
+    st.caption(
+        f"📁 {len(_saved)} record(s) in\n\n`{CSV_PATH}`"
+    )
+    if not os.access(DATA_DIR, os.W_OK):
+        st.error("This folder is not writable — invoices cannot be saved.")
+
     home_state = st.selectbox(
         "Your business state (place of supply origin)",
         STATES,
@@ -575,6 +596,14 @@ with st.sidebar:
         "Restart numbering each financial year",
         value=False,
         help="Off = numbers keep climbing forever. On = back to 001 every April.",
+    )
+    min_seq = st.number_input(
+        "Never number below",
+        min_value=0,
+        value=0,
+        step=1,
+        help="Safety floor. On Streamlit Cloud the disk is wiped on restart, "
+             "so set this to the last number you actually issued.",
     )
     st.divider()
     st.subheader("Make.com webhook")
@@ -615,7 +644,7 @@ with tab_entry:
     if st.session_state.pop("_advance_invoice", False):
         ref_date = st.session_state.get("inv_date", dt.date.today())
         st.session_state["invoice_no"] = next_invoice_no(
-            inv_prefix, ref_date, reset_each_fy
+            inv_prefix, ref_date, reset_each_fy, min_seq
         )
 
     flash = st.session_state.pop("_flash", None)
@@ -628,8 +657,17 @@ with tab_entry:
             "Date", value=dt.date.today(), format="DD/MM/YYYY", key="inv_date"
         )
     with c2:
-        auto_no = next_invoice_no(inv_prefix, inv_date, reset_each_fy)
-        st.session_state.setdefault("invoice_no", auto_no)
+        auto_no = next_invoice_no(inv_prefix, inv_date, reset_each_fy, min_seq)
+        # Follow the auto number when the prefix, date or floor changes - but
+        # only if the field still holds the previous auto value, so a manually
+        # typed number is never overwritten. Runs before the widget exists,
+        # which is the only point session state may be written.
+        prev_auto = st.session_state.get("_last_auto")
+        if "invoice_no" not in st.session_state:
+            st.session_state["invoice_no"] = auto_no
+        elif prev_auto is not None and st.session_state["invoice_no"] == prev_auto:
+            st.session_state["invoice_no"] = auto_no
+        st.session_state["_last_auto"] = auto_no
         invoice_no = st.text_input(
             "Invoice No",
             key="invoice_no",
@@ -955,4 +993,3 @@ with tab_records:
                     + ". Records may have been split across them. Move this "
                     "project out of OneDrive."
                 )
-                
