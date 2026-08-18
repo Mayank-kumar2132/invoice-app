@@ -39,17 +39,22 @@ LOGO_EXTS = (".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif")
 LOGO_DIRS = (BASE_DIR, os.path.join(BASE_DIR, "assets"))
 LOGO_INK_COLOR = "#1f2933"
 
-# Column headers kept EXACTLY as requested (including the odd spacing) so the
-# CSV and the webhook payload map 1:1 onto your existing sheet.
+# Exactly the columns in your Google Sheet, in sheet order. Reading, display
+# and the flat webhook payload all key off this list, so it must stay in sync
+# with the sheet's header row.
 COLUMNS = [
-    "Timestamp", "Date", "Invoice_No", "Client_Name", "Client_Address",
-    "Client_GST", "State", "GST_Code",
+    "Invoice_No", "Date", "Client_Name", "Client_Address", "Client_GST", "State",
     "Service_1", "Discription_1", "Amount_1",
     "Service_2", "Discription_2", "Amount_2",
-    "total_amount", "gst", "total_amount+ gst",
-    "Final Amount in words ", "Your Email Id",
-    # Appended at the end so existing column positions do not shift.
-    "HSN_1", "HSN_2",
+    "Service_3", "Amount_3",
+    "total_amount", "gst", "total",
+    "Amount_In_Words", "Email", "Phone", "Trigger",
+]
+
+# Computed values the sheet has no column for. Sent flat in the payload anyway,
+# so they can be mapped in Make the day you add columns for them.
+EXTRA_PAYLOAD_FIELDS = [
+    "Timestamp", "GST_Code", "HSN_1", "HSN_2", "HSN_3",
 ]
 
 # State -> GST state code. Stored zero-padded ("06", not "6") because that is
@@ -170,13 +175,28 @@ def now_ist() -> dt.datetime:
     return dt.datetime.now(IST)
 
 
-def parse_timestamps(series: pd.Series) -> pd.Series:
-    """Parse the Timestamp column, tolerating rows written by older versions."""
-    parsed = pd.to_datetime(series, format=TS_FORMAT, errors="coerce")
-    missing = parsed.isna() & series.astype(str).str.strip().ne("")
-    if missing.any():
+def parse_timestamps(df: pd.DataFrame) -> pd.Series:
+    """Best available creation time for each row.
+
+    The sheet has no Timestamp column, so fall back to the Date column
+    (dd-mm-yyyy) - that still gives correct ordering, just no clock time.
+    """
+    if "Timestamp" in df.columns:
+        raw = df["Timestamp"].astype(str)
+        parsed = pd.to_datetime(raw, format=TS_FORMAT, errors="coerce")
+    else:
+        parsed = pd.Series(pd.NaT, index=df.index)
+
+    missing = parsed.isna()
+    if missing.any() and "Date" in df.columns:
         parsed.loc[missing] = pd.to_datetime(
-            series[missing], errors="coerce", dayfirst=True
+            df.loc[missing, "Date"], format="%d-%m-%Y", errors="coerce"
+        )
+
+    missing = parsed.isna()
+    if missing.any() and "Date" in df.columns:
+        parsed.loc[missing] = pd.to_datetime(
+            df.loc[missing, "Date"], errors="coerce", dayfirst=True
         )
     return parsed
 
@@ -248,6 +268,219 @@ def amount_in_words(amount: float) -> str:
 # STORAGE
 # ----------------------------------------------------------------------------
 
+# ----------------------------------------------------------------------------
+# STORAGE
+#
+# Two backends behind one interface. Google Sheets is the real store: Streamlit
+# Cloud wipes its disk on every restart, so a local CSV cannot survive there.
+# The CSV backend stays for offline / local-only use.
+# ----------------------------------------------------------------------------
+
+SHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# Your sheet. Overridable from secrets or the sidebar.
+SHEET_ID_DEFAULT = "1KnDTMb00AaL8JBDS3UpXdRutJLzoPtTN37gHtE7RIRE"
+WORKSHEET_DEFAULT = "Streamlit"
+
+
+def extract_sheet_id(text: str) -> str:
+    """Accept either a bare ID or a full Google Sheets URL."""
+    text = (text or "").strip()
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", text)
+    return match.group(1) if match else text
+
+
+def sheet_url(sheet_id: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+
+
+def sheet_export_url(sheet_id: str, worksheet: str) -> str:
+    """Read-only CSV export of one tab. Works with no credentials as long as
+    the sheet is shared 'Anyone with the link - Viewer'."""
+    from urllib.parse import quote
+
+    return (
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+        f"/gviz/tq?tqx=out:csv&sheet={quote(worksheet)}"
+    )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_sheet_public(sheet_id: str, worksheet: str) -> pd.DataFrame:
+    """Read the tab over plain HTTP. No service account needed.
+
+    Make writes the rows; this only reads them back for the Records tab and
+    for working out the next invoice number.
+    """
+    import io
+
+    resp = requests.get(sheet_export_url(sheet_id, worksheet), timeout=20)
+
+    # A sheet that is not link-shared returns a sign-in HTML page, not CSV.
+    text = resp.text or ""
+    if resp.status_code != 200 or text.lstrip()[:1] == "<":
+        raise RuntimeError(
+            "Sheet is not readable by link. Open it → Share → General access → "
+            "'Anyone with the link' → Viewer. Also check the tab name."
+        )
+
+    try:
+        df = pd.read_csv(io.StringIO(text), dtype=str)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=COLUMNS)
+
+    df = df.fillna("")
+    df.columns = [str(c).strip() for c in df.columns]
+    # Sheets often have trailing empty header cells; pandas names them
+    # "Unnamed: 21" and they would otherwise show up as junk columns.
+    df = df.loc[:, [c for c in df.columns if c and not c.startswith("Unnamed")]]
+    if "Invoice_No" not in df.columns:
+        raise RuntimeError(
+            f"Tab '{worksheet}' has no Invoice_No column. Header row must match "
+            "the app's column names."
+        )
+    for col in COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[df["Invoice_No"].astype(str).str.strip() != ""]
+    return df[COLUMNS]
+
+
+def one_line(value: str) -> str:
+    """Collapse newlines and tabs so one record is always one row.
+
+    Embedded newlines are legal CSV, but they break the moment anything other
+    than pandas touches the file (Excel, Notepad, a OneDrive conflict merge, a
+    naive line-by-line reader), which silently loses or splits records.
+    """
+    return re.sub(r"\s*[\r\n\t]+\s*", ", ", str(value)).strip().strip(",").strip()
+
+
+def secret(key: str, default: str = "") -> str:
+    """Read a secret without exploding when no secrets file exists at all."""
+    try:
+        return str(st.secrets.get(key, default))
+    except Exception:  # noqa: BLE001 - StreamlitSecretNotFoundError
+        return default
+
+
+def has_service_account() -> bool:
+    try:
+        return "gcp_service_account" in st.secrets
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def storage_cfg() -> dict:
+    """Backend settings, written by the sidebar before anything reads them."""
+    return st.session_state.get("_storage", {"mode": "csv"})
+
+
+# ---- Google Sheets backend --------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def get_worksheet(sheet_id: str, worksheet_name: str):
+    """Authorised worksheet handle. Cached so each rerun does not re-auth."""
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    if not has_service_account():
+        raise RuntimeError(
+            "No [gcp_service_account] block in secrets. Add the service account "
+            "JSON to .streamlit/secrets.toml (or the Secrets box on Streamlit "
+            "Cloud)."
+        )
+
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=SHEET_SCOPES
+    )
+    client = gspread.authorize(creds)
+
+    try:
+        spreadsheet = client.open_by_key(sheet_id)
+    except gspread.SpreadsheetNotFound as exc:
+        raise RuntimeError(
+            f"Sheet {sheet_id} not found. Check the ID, and share the sheet "
+            "with the service account email as Editor."
+        ) from exc
+    except gspread.exceptions.APIError as exc:
+        raise RuntimeError(f"Google API error: {exc}") from exc
+
+    try:
+        worksheet = spreadsheet.worksheet(worksheet_name)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            worksheet_name, rows=2000, cols=max(len(COLUMNS), 26)
+        )
+
+    # Make sure the header row exists and covers every column we write.
+    header = worksheet.row_values(1)
+    if not header:
+        worksheet.update([COLUMNS], "A1")
+    else:
+        missing = [c for c in COLUMNS if c not in header]
+        if missing:
+            worksheet.update([header + missing], "A1")
+
+    return worksheet
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_sheet(sheet_id: str, worksheet_name: str) -> pd.DataFrame:
+    """Every row from the sheet. Cached for 60s because Streamlit reruns on
+    every keystroke and the Sheets API allows only 60 reads/minute."""
+    worksheet = get_worksheet(sheet_id, worksheet_name)
+    values = worksheet.get_all_values()
+    if len(values) < 2:
+        return pd.DataFrame(columns=COLUMNS)
+
+    header = values[0]
+    width = len(header)
+    rows = [r + [""] * (width - len(r)) for r in values[1:]]
+    df = pd.DataFrame(rows, columns=header)
+    for col in COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    # Drop fully blank rows - people leave gaps at the bottom of sheets.
+    df = df[df["Invoice_No"].astype(str).str.strip() != ""]
+    return df[COLUMNS].fillna("")
+
+
+def append_sheet(clean: dict, sheet_id: str, worksheet_name: str) -> None:
+    worksheet = get_worksheet(sheet_id, worksheet_name)
+    header = worksheet.row_values(1)
+    # Follow the sheet's own column order, not ours, so a reordered sheet
+    # cannot shift every value one cell across.
+    worksheet.append_row(
+        [clean.get(h, "") for h in header], value_input_option="USER_ENTERED"
+    )
+
+
+def delete_sheet_rows(invoice_nos: list[str], sheet_id: str, worksheet_name: str) -> int:
+    worksheet = get_worksheet(sheet_id, worksheet_name)
+    values = worksheet.get_all_values()
+    if not values:
+        return 0
+    header = values[0]
+    if "Invoice_No" not in header:
+        raise RuntimeError("Sheet has no Invoice_No column.")
+    col = header.index("Invoice_No")
+    targets = {n.strip() for n in invoice_nos}
+
+    # Sheet rows are 1-indexed and row 1 is the header. Delete bottom-up so
+    # earlier deletions do not shift the indices of later ones.
+    hits = [
+        i + 1
+        for i, row in enumerate(values)
+        if i > 0 and len(row) > col and row[col].strip() in targets
+    ]
+    for row_number in sorted(hits, reverse=True):
+        worksheet.delete_rows(row_number)
+    return len(hits)
+
+
+# ---- CSV backend ------------------------------------------------------------
+
 def ensure_store() -> None:
     """Create the CSV if missing, and upgrade its header if the schema changed."""
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -255,9 +488,8 @@ def ensure_store() -> None:
         pd.DataFrame(columns=COLUMNS).to_csv(CSV_PATH, index=False)
         return
 
-    # A CSV written by an older version has no GST_Code column. Appending new
-    # rows to it would shift every field one place, so migrate it in place and
-    # backfill GST_Code from the State already stored on each row.
+    # A CSV written by an older version is missing newer columns. Appending to
+    # it would shift every field one place, so migrate in place.
     try:
         existing = pd.read_csv(CSV_PATH, dtype=str)
     except pd.errors.EmptyDataError:
@@ -270,16 +502,11 @@ def ensure_store() -> None:
     for col in COLUMNS:
         if col not in existing.columns:
             existing[col] = ""
-    if "State" in existing.columns:
-        blank = existing["GST_Code"].isna() | (existing["GST_Code"].astype(str).str.strip() == "")
-        existing.loc[blank, "GST_Code"] = (
-            existing.loc[blank, "State"].map(STATE_CODES).fillna("")
-        )
     existing[COLUMNS].to_csv(CSV_PATH, index=False)
 
 
-@st.cache_data(ttl=5)
-def load_data() -> pd.DataFrame:
+@st.cache_data(ttl=5, show_spinner=False)
+def load_csv() -> pd.DataFrame:
     ensure_store()
     try:
         return pd.read_csv(CSV_PATH, dtype=str).fillna("")
@@ -287,26 +514,8 @@ def load_data() -> pd.DataFrame:
         return pd.DataFrame(columns=COLUMNS)
 
 
-def one_line(value: str) -> str:
-    """Collapse newlines and tabs so one record is always one line in the CSV.
-
-    Embedded newlines are legal CSV, but they break the moment anything other
-    than pandas touches the file (Excel, Notepad, a OneDrive conflict merge, a
-    naive line-by-line reader), which silently loses or splits records.
-    """
-    return re.sub(r"\s*[\r\n\t]+\s*", ", ", str(value)).strip().strip(",").strip()
-
-
-def append_row(row: dict) -> None:
-    """Append one record, then confirm it is really on disk.
-
-    A silent write failure - file locked by Excel, OneDrive mid-sync, no disk
-    permission - would otherwise look like a successful save while the record
-    vanishes.
-    """
+def append_csv(clean: dict) -> None:
     ensure_store()
-    clean = {c: one_line(row.get(c, "")) for c in COLUMNS}
-
     try:
         pd.DataFrame([clean], columns=COLUMNS).to_csv(
             CSV_PATH, mode="a", header=False, index=False
@@ -317,15 +526,108 @@ def append_row(row: dict) -> None:
             f"(Excel?). Close it and save again. ({exc})"
         ) from exc
 
-    load_data.clear()
 
-    check = pd.read_csv(CSV_PATH, dtype=str).fillna("")
-    if clean["Invoice_No"] not in set(check["Invoice_No"].astype(str).str.strip()):
+def delete_csv_rows(invoice_nos: list[str]) -> int:
+    ensure_store()
+    df = pd.read_csv(CSV_PATH, dtype=str).fillna("")
+    targets = {n.strip() for n in invoice_nos}
+    keep = ~df["Invoice_No"].astype(str).str.strip().isin(targets)
+    removed = int((~keep).sum())
+
+    tmp = f"{CSV_PATH}.tmp"
+    df[keep][COLUMNS].to_csv(tmp, index=False)
+    os.replace(tmp, CSV_PATH)  # atomic, so a crash cannot truncate the file
+    return removed
+
+
+# ---- dispatch ---------------------------------------------------------------
+
+def refresh_store() -> None:
+    load_csv.clear()
+    load_sheet.clear()
+    load_sheet_public.clear()
+
+
+def load_data() -> pd.DataFrame:
+    cfg = storage_cfg()
+    mode = cfg.get("mode")
+    if mode == "sheet_link":
+        return load_sheet_public(cfg["sheet_id"], cfg["worksheet"])
+    if mode == "sheet":
+        return load_sheet(cfg["sheet_id"], cfg["worksheet"])
+    return load_csv()
+
+
+def issued_this_session() -> set[str]:
+    """Invoice numbers already sent to Make but perhaps not yet visible.
+
+    Make writes to the sheet asynchronously, so for a few seconds after saving
+    the sheet still shows the old maximum. Without this the next invoice would
+    reuse the number that was just issued.
+    """
+    return set(st.session_state.get("_issued", []))
+
+
+def mark_issued(invoice_no: str) -> None:
+    st.session_state.setdefault("_issued", [])
+    if invoice_no not in st.session_state["_issued"]:
+        st.session_state["_issued"].append(invoice_no)
+
+
+def wait_for_row(invoice_no: str, tries: int = 3, delay: float = 2.0) -> bool:
+    """Poll the store briefly so Records reflects the new row right away."""
+    for attempt in range(tries):
+        time.sleep(delay if attempt else 1.0)
+        refresh_store()
+        try:
+            df = load_data()
+        except Exception:  # noqa: BLE001
+            continue
+        if invoice_no in set(df["Invoice_No"].astype(str).str.strip()):
+            return True
+    return False
+
+
+def append_row(row: dict) -> None:
+    """Write one record directly, then confirm it really landed.
+
+    Not used in link mode - there the webhook is the only writer.
+    """
+    cfg = storage_cfg()
+    clean = {c: one_line(row.get(c, "")) for c in COLUMNS}
+
+    if cfg.get("mode") == "sheet":
+        append_sheet(clean, cfg["sheet_id"], cfg["worksheet"])
+    else:
+        append_csv(clean)
+
+    refresh_store()
+
+    saved = load_data()
+    if clean["Invoice_No"] not in set(
+        saved["Invoice_No"].astype(str).str.strip()
+    ):
+        where = "the Google Sheet" if cfg.get("mode") == "sheet" else CSV_PATH
         raise RuntimeError(
-            f"{clean['Invoice_No']} did not persist to {CSV_PATH}. "
-            "If this folder is inside OneDrive or Dropbox, move the project to "
-            "a local path such as C:\\dev\\invoice-app."
+            f"{clean['Invoice_No']} did not persist to {where}. Nothing was "
+            "saved - check the connection and try again."
         )
+
+
+def delete_rows(invoice_nos: list[str]) -> int:
+    cfg = storage_cfg()
+    mode = cfg.get("mode")
+    if mode == "sheet_link":
+        raise RuntimeError(
+            "Link mode is read-only. Delete the row in the Google Sheet "
+            "itself, then press Refresh."
+        )
+    if mode == "sheet":
+        removed = delete_sheet_rows(invoice_nos, cfg["sheet_id"], cfg["worksheet"])
+    else:
+        removed = delete_csv_rows(invoice_nos)
+    refresh_store()
+    return removed
 
 
 def fy_label(d: dt.date) -> str:
@@ -343,16 +645,17 @@ def last_sequence(prefix: str = "", fy: str = "") -> int:
     restarts each financial year).
     """
     df = load_data()
-    if df.empty or "Invoice_No" not in df.columns:
-        return 0
+    numbers = list(df["Invoice_No"].astype(str)) if not df.empty else []
+    # Include numbers already sent to Make: the sheet lags a second or two
+    # behind, and reusing a just-issued number would be a GST problem.
+    numbers += list(issued_this_session())
 
-    series = df["Invoice_No"].astype(str)
     if prefix or fy:
-        series = series[series.str.startswith(f"{prefix}/{fy}/")]
+        numbers = [n for n in numbers if n.startswith(f"{prefix}/{fy}/")]
 
     seq = 0
-    for val in series:
-        m = re.search(r"(\d+)\s*$", val.strip())
+    for val in numbers:
+        m = re.search(r"(\d+)\s*$", str(val).strip())
         if m:
             seq = max(seq, int(m.group(1)))
     return seq
@@ -576,12 +879,84 @@ else:
 with st.sidebar:
     st.header("Settings")
 
+    # Must run before anything calls load_data().
+    with st.expander("Storage", expanded=False):
+        default_sheet = secret("sheet_id", SHEET_ID_DEFAULT)
+        default_ws = secret("worksheet", WORKSHEET_DEFAULT)
+        creds_ready = has_service_account()
+
+        modes = {
+            "Google Sheet (Make writes it)": "sheet_link",
+            "Google Sheet (app writes it)": "sheet",
+            "Local CSV": "csv",
+        }
+        mode_label = st.radio(
+            "Records come from",
+            list(modes),
+            index=0,
+            help="Default: Make posts each invoice into the sheet and the app "
+                 "reads it back. No Google credentials needed.",
+        )
+        mode = modes[mode_label]
+
+        if mode == "sheet" and not creds_ready:
+            st.warning(
+                "App-writes mode needs a `[gcp_service_account]` block in "
+                "secrets. Use the first option instead."
+            )
+
+        if mode in ("sheet_link", "sheet"):
+            sheet_id = extract_sheet_id(
+                st.text_input(
+                    "Sheet ID or URL",
+                    value=default_sheet,
+                    help="Paste the whole URL if easier — the ID is extracted.",
+                )
+            )
+            worksheet_name = st.text_input("Worksheet (tab) name", value=default_ws)
+            st.session_state["_storage"] = {
+                "mode": mode,
+                "sheet_id": sheet_id,
+                "worksheet": worksheet_name.strip() or WORKSHEET_DEFAULT,
+            }
+            if mode == "sheet_link":
+                st.caption(
+                    "Sheet must be shared: **Anyone with the link → Viewer**. "
+                    "Writing is done by your Make scenario."
+                )
+            else:
+                svc_email = ""
+                try:
+                    svc_email = st.secrets["gcp_service_account"].get("client_email", "")
+                except Exception:  # noqa: BLE001
+                    pass
+                if svc_email:
+                    st.caption(f"Sheet must be shared with:\n\n`{svc_email}`")
+
+            if st.button("🔌 Test sheet connection", width="stretch"):
+                try:
+                    rows = len(load_data())
+                    st.success(f"Connected. {rows} record(s) readable.")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(str(exc))
+            st.caption(f"[Open sheet]({sheet_url(sheet_id)})")
+        else:
+            st.session_state["_storage"] = {"mode": "csv"}
+            st.caption(f"`{CSV_PATH}`")
+
     # Always visible, so "my records vanished" is answerable at a glance.
-    _saved = load_data()
-    st.caption(
-        f"📁 {len(_saved)} record(s) in\n\n`{CSV_PATH}`"
-    )
-    if not os.access(DATA_DIR, os.W_OK):
+    _cfg = storage_cfg()
+    try:
+        _saved = load_data()
+        if _cfg["mode"] in ("sheet", "sheet_link"):
+            st.caption(f"📊 {len(_saved)} record(s) in Google Sheet `{_cfg['worksheet']}`")
+        else:
+            st.caption(f"📁 {len(_saved)} record(s) in\n\n`{CSV_PATH}`")
+    except Exception as exc:  # noqa: BLE001 - surface any backend failure
+        _saved = pd.DataFrame(columns=COLUMNS)
+        st.error(f"Storage unavailable: {exc}")
+
+    if _cfg["mode"] == "csv" and not os.access(DATA_DIR, os.W_OK):
         st.error("This folder is not writable — invoices cannot be saved.")
 
     home_state = st.selectbox(
@@ -611,6 +986,12 @@ with st.sidebar:
     webhook_url = st.text_input(
         "Webhook URL", value=WEBHOOK_URL_DEFAULT, type="default"
     )
+    trigger_value = st.text_input(
+        "Trigger column value",
+        value="",
+        help="Whatever your Make scenario expects in the sheet's Trigger "
+             "column. Leave blank if Make fills it itself.",
+    ).strip()
 
     if st.button("🔌 Send test payload", width="stretch"):
         ok, msg = post_webhook(
@@ -635,6 +1016,46 @@ with st.sidebar:
             st.rerun()
 
 st.title("Invoice Data Entry")
+
+# If the store cannot be read, stop here. Carrying on with an empty dataset
+# would restart numbering at 001 and issue duplicate invoice numbers.
+try:
+    load_data()
+except Exception as exc:  # noqa: BLE001 - any backend failure
+    st.error(f"Cannot reach the record store: {exc}")
+    _c = storage_cfg()
+    if _c["mode"] == "sheet_link":
+        st.markdown(
+            f"""
+**Checklist**
+
+1. Open the sheet → **Share** → General access → **Anyone with the link** →
+   **Viewer**. Without this Google returns a sign-in page instead of data.
+2. A tab named exactly `{_c['worksheet']}` exists.
+3. Its first row is a header row containing `Invoice_No`.
+
+[Open sheet]({sheet_url(_c['sheet_id'])}) · Sidebar → Storage →
+**Test sheet connection** reports the exact failure. You can switch to
+**Local CSV** there to keep working offline.
+"""
+        )
+    elif _c["mode"] == "sheet":
+        st.markdown(
+            f"""
+**Checklist**
+
+1. `[gcp_service_account]` block present in secrets (Streamlit Cloud →
+   Settings → Secrets, or `.streamlit/secrets.toml` locally). Paste the JSON
+   key exactly — the `private_key` must keep its `\\n` escapes.
+2. Google Sheets API enabled in that Cloud project.
+3. Sheet shared with the service account email as **Editor**.
+4. Tab named `{_c['worksheet']}` exists in the sheet.
+
+Sidebar → Storage → **Test sheet connection** reports the exact failure.
+You can switch to **Local CSV** there to keep working offline.
+"""
+        )
+    st.stop()
 
 tab_entry, tab_records = st.tabs(["New entry", "Records"])
 
@@ -679,7 +1100,8 @@ with tab_entry:
                 st.session_state["_advance_invoice"] = True
                 st.rerun()
     with c3:
-        email = st.text_input("Your Email Id *", placeholder="you@company.com")
+        email = st.text_input("Email *", placeholder="you@company.com")
+        phone = st.text_input("Phone", placeholder="9876543210", max_chars=15)
 
     st.subheader("Billing details")
     st.caption("Fields marked * are mandatory.")
@@ -703,7 +1125,7 @@ with tab_entry:
         ).strip().upper()
 
     st.subheader("Line items")
-    l1, l2 = st.columns(2)
+    l1, l2, l3 = st.columns(3)
     with l1:
         st.markdown("**Item 1**")
         cat_1 = st.selectbox("Category *", CATEGORIES, key="cat_1")
@@ -714,14 +1136,12 @@ with tab_entry:
         amount_1 = st.number_input("Amount_1", min_value=0.0, step=500.0, format="%.2f")
     with l2:
         st.markdown("**Item 2** *(optional)*")
-        cat_2 = st.selectbox("Category", [NO_SERVICE] + CATEGORIES, key="cat_2")
+        cat_2 = st.selectbox("Category ", [NO_SERVICE] + CATEGORIES, key="cat_2")
         if cat_2 == NO_SERVICE:
-            service_2 = ""
+            service_2, desc_2, amount_2 = "", "", 0.0
             st.selectbox("Service_2", ["—"], disabled=True, key="svc_2_off")
-            desc_2 = ""
             st.text_area("Discription_2", value="", height=90, disabled=True,
                          key="d2_off")
-            amount_2 = 0.0
             st.number_input("Amount_2", value=0.0, disabled=True, key="amt_2_off",
                             format="%.2f")
         else:
@@ -732,6 +1152,22 @@ with tab_entry:
             amount_2 = st.number_input(
                 "Amount_2", min_value=0.0, step=500.0, format="%.2f"
             )
+    with l3:
+        # The sheet has Service_3 and Amount_3 but no Discription_3.
+        st.markdown("**Item 3** *(optional)*")
+        cat_3 = st.selectbox("Category  ", [NO_SERVICE] + CATEGORIES, key="cat_3")
+        if cat_3 == NO_SERVICE:
+            service_3, amount_3 = "", 0.0
+            st.selectbox("Service_3", ["—"], disabled=True, key="svc_3_off")
+            st.number_input("Amount_3", value=0.0, disabled=True, key="amt_3_off",
+                            format="%.2f")
+        else:
+            service_3 = st.selectbox(
+                "Service_3", SERVICE_CATALOG[cat_3]["options"], key="svc_3"
+            )
+            amount_3 = st.number_input(
+                "Amount_3", min_value=0.0, step=500.0, format="%.2f"
+            )
 
     # ---- HSN / SAC, derived from the chosen category ----
     st.subheader("HSN / SAC")
@@ -739,7 +1175,7 @@ with tab_entry:
         "Filled automatically from the service category. Edit if a particular "
         "invoice needs a different code."
     )
-    h1, h2 = st.columns(2)
+    h1, h2, h3 = st.columns(3)
     with h1:
         hsn_1 = st.text_input(
             f"HSN/SAC — Item 1 ({cat_1})",
@@ -759,9 +1195,21 @@ with tab_entry:
                 key=f"hsn_2_{cat_2}",
                 max_chars=8,
             ).strip()
+    with h3:
+        if cat_3 == NO_SERVICE:
+            hsn_3 = ""
+            st.text_input("HSN/SAC — Item 3", value="", disabled=True,
+                          key="hsn_3_off")
+        else:
+            hsn_3 = st.text_input(
+                f"HSN/SAC — Item 3 ({cat_3})",
+                value=SERVICE_CATALOG[cat_3]["sac"],
+                key=f"hsn_3_{cat_3}",
+                max_chars=8,
+            ).strip()
 
     # ---- live calculation ----
-    total_amount = round(amount_1 + amount_2, 2)
+    total_amount = round(amount_1 + amount_2 + amount_3, 2)
     gst_amount = round(total_amount * gst_rate / 100, 2)
     grand_total = round(total_amount + gst_amount, 2)
     words = amount_in_words(grand_total)
@@ -812,8 +1260,19 @@ with tab_entry:
             )
         if not hsn_2 or not hsn_2.isdigit():
             errors.append("HSN/SAC for Item 2 must be numeric.")
+    if cat_3 != NO_SERVICE:
+        if amount_3 <= 0:
+            errors.append(
+                f"Item 3 is set to '{service_3}' but Amount_3 is 0. "
+                "Set an amount or switch Category back to none."
+            )
+        if not hsn_3 or not hsn_3.isdigit():
+            errors.append("HSN/SAC for Item 3 must be numeric.")
+    digits = re.sub(r"\D", "", phone)
+    if phone.strip() and len(digits) not in (10, 11, 12):
+        errors.append("Phone should be a 10-digit number (optionally with 91).")
     if not email.strip():
-        errors.append("Your Email Id is required.")
+        errors.append("Email is required.")
     elif not EMAIL_RE.match(email.strip()):
         errors.append("Email Id looks invalid.")
     if not client_gst:
@@ -835,52 +1294,99 @@ with tab_entry:
                 st.error(e)
         else:
             row = {
-                "Timestamp": now_ist().strftime(TS_FORMAT),
-                "Date": inv_date.strftime("%d-%m-%Y"),
                 "Invoice_No": invoice_no.strip(),
+                "Date": inv_date.strftime("%d-%m-%Y"),
                 "Client_Name": billing_name.strip(),
                 "Client_Address": billing_address.strip(),
                 "Client_GST": client_gst,
                 "State": state,
-                "GST_Code": gst_code,
                 "Service_1": service_1.strip(),
-                "HSN_1": hsn_1,
                 "Discription_1": desc_1.strip(),
                 "Amount_1": f"{amount_1:.2f}",
                 "Service_2": service_2.strip(),
-                "HSN_2": hsn_2,
                 "Discription_2": desc_2.strip(),
                 "Amount_2": f"{amount_2:.2f}",
+                "Service_3": service_3.strip(),
+                "Amount_3": f"{amount_3:.2f}",
                 "total_amount": f"{total_amount:.2f}",
                 "gst": f"{gst_amount:.2f}",
-                "total_amount+ gst": f"{grand_total:.2f}",
-                "Final Amount in words ": words,
-                "Your Email Id": email.strip(),
+                "total": f"{grand_total:.2f}",
+                "Amount_In_Words": words,
+                "Email": email.strip(),
+                "Phone": phone.strip(),
+                "Trigger": trigger_value,
+                # Not columns in the sheet, but sent so Make can map them if
+                # you add columns later.
+                "Timestamp": now_ist().strftime(TS_FORMAT),
+                "GST_Code": gst_code,
+                "HSN_1": hsn_1,
+                "HSN_2": hsn_2,
+                "HSN_3": hsn_3,
             }
-            try:
-                append_row(row)
-            except RuntimeError as exc:
-                st.error(str(exc))
-                st.stop()
-            msgs = [f"Saved **{row['Invoice_No']}** for {row['Client_Name']}."]
+            mode = storage_cfg()["mode"]
 
-            if send_webhook:
+            if mode == "sheet_link":
+                # Make is the only writer here, so a failed post means the
+                # invoice was NOT saved anywhere. Never report success.
+                if not send_webhook:
+                    st.error(
+                        "Webhook is switched off, and in this mode the webhook "
+                        "is what writes to the sheet. Turn it on in the sidebar."
+                    )
+                    st.stop()
+
                 payload = build_payload(
                     {**row, "_cat_1": cat_1,
                      "_cat_2": "" if cat_2 == NO_SERVICE else cat_2},
                     gst_rate, intra, gst_amount,
                 )
                 ok, detail = post_webhook(webhook_url, payload)
-                if ok:
-                    msgs.append(f"Sent to webhook ({detail}).")
-                else:
-                    # CSV already holds the row, and the payload is queued, so
-                    # nothing is lost if Make is unreachable.
+                if not ok:
                     queue_pending(payload)
-                    msgs.append(
-                        f"⚠️ Webhook failed: {detail}. Queued for retry — use "
-                        "the sidebar once it is back."
+                    st.error(
+                        f"Not saved — webhook failed: {detail}. The invoice is "
+                        "queued; retry from the sidebar once Make is reachable."
                     )
+                    st.stop()
+
+                mark_issued(row["Invoice_No"])
+                msgs = [
+                    f"Sent **{row['Invoice_No']}** for {row['Client_Name']} "
+                    f"to Make ({detail})."
+                ]
+                with st.spinner("Waiting for the row to appear in the sheet…"):
+                    landed = wait_for_row(row["Invoice_No"])
+                msgs.append(
+                    "Row is in the sheet." if landed else
+                    "Make has accepted it; the sheet may take a few more "
+                    "seconds. Press Refresh in Records."
+                )
+            else:
+                try:
+                    append_row(row)
+                except RuntimeError as exc:
+                    st.error(str(exc))
+                    st.stop()
+                mark_issued(row["Invoice_No"])
+                msgs = [f"Saved **{row['Invoice_No']}** for {row['Client_Name']}."]
+
+                if send_webhook:
+                    payload = build_payload(
+                        {**row, "_cat_1": cat_1,
+                         "_cat_2": "" if cat_2 == NO_SERVICE else cat_2},
+                        gst_rate, intra, gst_amount,
+                    )
+                    ok, detail = post_webhook(webhook_url, payload)
+                    if ok:
+                        msgs.append(f"Sent to webhook ({detail}).")
+                    else:
+                        # The record is already stored, and the payload is
+                        # queued, so nothing is lost if Make is unreachable.
+                        queue_pending(payload)
+                        msgs.append(
+                            f"⚠️ Webhook failed: {detail}. Queued for retry — "
+                            "use the sidebar once it is back."
+                        )
 
             # Messages have to survive the rerun, so stash them instead of
             # calling st.success() here.
@@ -889,18 +1395,36 @@ with tab_entry:
             st.rerun()
 
 with tab_records:
-    df = load_data()
+    # Delete happens in this tab, so its confirmation belongs here too.
+    _rf = st.session_state.pop("_flash", None)
+    if _rf:
+        st.success(_rf)
+    _rfe = st.session_state.pop("_flash_error", None)
+    if _rfe:
+        st.error(_rfe)
+
+    try:
+        df = load_data()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not read records: {exc}")
+        st.stop()
     if df.empty:
         st.info("No invoices saved yet.")
     else:
         # Split the stored Timestamp into readable date and time columns for
         # display. Timestamp itself stays untouched in the CSV and the webhook.
         df = df.reset_index(drop=True)
-        ts = parse_timestamps(df["Timestamp"])
+        ts = parse_timestamps(df)
+        # Only rows with a real Timestamp have a clock time. Rows dated from
+        # the Date column alone would otherwise all read "00:00:00".
+        if "Timestamp" in df.columns:
+            clock = pd.to_datetime(df["Timestamp"], format=TS_FORMAT, errors="coerce")
+        else:
+            clock = pd.Series(pd.NaT, index=df.index)
         df = df.assign(
             **{
                 "Created Date": ts.dt.strftime("%d-%m-%Y").fillna(""),
-                "Created Time": ts.dt.strftime("%H:%M:%S").fillna(""),
+                "Created Time": clock.dt.strftime("%H:%M:%S").fillna(""),
                 "_ts": ts,
                 # Position in the file breaks ties when several invoices share
                 # the same second, so the genuinely newest row stays on top.
@@ -919,7 +1443,7 @@ with tab_records:
             q = st.text_input("Search billing name / invoice no / GST")
         with top[1]:
             if st.button("↻ Refresh", width="stretch"):
-                load_data.clear()
+                refresh_store()
                 st.rerun()
 
         view = df
@@ -937,17 +1461,33 @@ with tab_records:
             ["_ts", "_pos"], ascending=[False, False], na_position="last"
         )
 
+        def col_sum(frame: pd.DataFrame, *cols: str) -> float:
+            """Numeric total across columns, ignoring blanks and stray text."""
+            total = 0.0
+            for col in cols:
+                if col in frame.columns:
+                    total += pd.to_numeric(frame[col], errors="coerce").fillna(0).sum()
+            return float(total)
+
+        amount_total = col_sum(view, "Amount_1", "Amount_2", "Amount_3")
+        gst_total = col_sum(view, "gst")
+        grand = amount_total + gst_total
+
         m1, m2, m3, m4 = st.columns(4)
-        billed = pd.to_numeric(view["total_amount+ gst"], errors="coerce").sum()
-        gst_collected = pd.to_numeric(view["gst"], errors="coerce").sum()
-        m1.metric("Invoices shown", f"{len(view)} of {len(df)}")
-        m2.metric("Total billed", f"₹ {billed:,.0f}")
-        m3.metric("GST collected", f"₹ {gst_collected:,.0f}")
-        valid_ts = df["_ts"].dropna()
-        m4.metric(
-            "First entry",
-            valid_ts.min().strftime("%d-%m-%Y") if not valid_ts.empty else "—",
-        )
+        m1.metric("Total invoices created", f"{len(view)}")
+        m2.metric("Total amount", f"₹ {amount_total:,.0f}")
+        m3.metric("Total GST", f"₹ {gst_total:,.0f}")
+        m4.metric("Total amount + GST", f"₹ {grand:,.0f}")
+
+        # The sheet carries its own `total` column. If it disagrees with the
+        # arithmetic above, some row was written or edited badly.
+        sheet_total = col_sum(view, "total")
+        if sheet_total and abs(sheet_total - grand) > 1:
+            st.caption(
+                f"⚠️ The sheet's own `total` column adds up to "
+                f"₹{sheet_total:,.0f}, which does not match ₹{grand:,.0f}. "
+                "Check for a row with a missing or hand-edited amount."
+            )
 
         st.dataframe(
             view[ordered],
@@ -967,29 +1507,82 @@ with tab_records:
             help="Every record ever saved, not just the filtered view.",
         )
 
-        with st.expander("Storage check"):
-            physical = sum(1 for _ in open(CSV_PATH, encoding="utf-8")) - 1
-            st.write(
-                {
-                    "file": os.path.abspath(CSV_PATH),
-                    "records parsed": len(df),
-                    "data lines in file": physical,
-                    "unparseable timestamps": int(df["_ts"].isna().sum()),
-                }
+        # ---- delete records ----
+        with st.expander("🗑️ Delete records"):
+            st.caption(
+                "Under GST an invoice that has already been issued should be "
+                "cancelled with a credit note, not deleted. Use this for test "
+                "entries and mistakes made before the invoice went out."
             )
-            if physical != len(df):
+            if storage_cfg()["mode"] == "sheet_link":
+                st.info(
+                    "This mode reads the sheet over a public link, so it "
+                    "cannot delete. Delete the row in the sheet, then press "
+                    "Refresh above.\n\n"
+                    f"[Open sheet]({sheet_url(storage_cfg()['sheet_id'])})"
+                )
+            to_delete = st.multiselect(
+                "Select invoices to delete",
+                options=list(view["Invoice_No"].astype(str)),
+                help="Deletes the row from the record store.",
+                disabled=storage_cfg()["mode"] == "sheet_link",
+            )
+            if to_delete:
                 st.warning(
-                    "Line count does not match record count — the CSV was "
-                    "probably edited outside this app."
+                    f"About to permanently delete {len(to_delete)} record(s): "
+                    + ", ".join(to_delete)
                 )
-            conflicts = [
-                f for f in os.listdir(DATA_DIR)
-                if f.startswith("invoices") and f != os.path.basename(CSV_PATH)
-            ]
-            if conflicts:
-                st.error(
-                    "Sync conflict copies found in data/: "
-                    + ", ".join(conflicts)
-                    + ". Records may have been split across them. Move this "
-                    "project out of OneDrive."
+                confirm = st.checkbox("Yes, delete them permanently")
+                if st.button("Delete selected", type="primary", disabled=not confirm):
+                    try:
+                        removed = delete_rows(to_delete)
+                        st.session_state["_flash"] = (
+                            f"Deleted {removed} record(s)."
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.session_state["_flash_error"] = f"Delete failed: {exc}"
+                    st.rerun()
+
+        with st.expander("Storage check"):
+            _c = storage_cfg()
+            if _c["mode"] in ("sheet", "sheet_link"):
+                st.write(
+                    {
+                        "backend": ("Google Sheet (Make writes)"
+                                    if _c["mode"] == "sheet_link"
+                                    else "Google Sheet (app writes)"),
+                        "sheet id": _c["sheet_id"],
+                        "worksheet": _c["worksheet"],
+                        "records": len(df),
+                        "unparseable timestamps": int(df["_ts"].isna().sum()),
+                        "cache": "60s — press Refresh after editing the sheet "
+                                 "by hand",
+                    }
                 )
+            else:
+                physical = sum(1 for _ in open(CSV_PATH, encoding="utf-8")) - 1
+                st.write(
+                    {
+                        "backend": "Local CSV",
+                        "file": os.path.abspath(CSV_PATH),
+                        "records parsed": len(df),
+                        "data lines in file": physical,
+                        "unparseable timestamps": int(df["_ts"].isna().sum()),
+                    }
+                )
+                if physical != len(df):
+                    st.warning(
+                        "Line count does not match record count — the CSV was "
+                        "probably edited outside this app."
+                    )
+                conflicts = [
+                    f for f in os.listdir(DATA_DIR)
+                    if f.startswith("invoices") and f != os.path.basename(CSV_PATH)
+                ]
+                if conflicts:
+                    st.error(
+                        "Sync conflict copies found in data/: "
+                        + ", ".join(conflicts)
+                        + ". Records may have been split across them. Move this "
+                        "project out of OneDrive."
+                    )
