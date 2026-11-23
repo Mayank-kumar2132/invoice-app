@@ -57,6 +57,18 @@ invoice-app/
 | `total_amount+ gst` | `total_amount + gst` |
 | `Final Amount in words ` | Indian numbering — lakh / crore, with paise |
 
+## Invoice type: Proforma vs Tax Invoice
+
+At the top of the form, **Invoice type** is picked for you from the Client GST:
+
+- GSTIN with **no earlier invoice** on record → **Proforma Invoice**
+- GSTIN that **already has an invoice** → **Tax Invoice**
+
+You can switch it manually (a warning shows when you override the suggestion).
+Both types share the same invoice number series. The type is sent in the
+webhook payload as `Invoice_Type` (and saved in that column); Records shows it
+and has a Type filter. Older rows with no type are treated as Tax Invoices.
+
 Extra safeguards:
 
 - **GSTIN format check** (15-char pattern) plus a warning if the GSTIN's state

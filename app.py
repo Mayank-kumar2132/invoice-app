@@ -49,7 +49,15 @@ COLUMNS = [
     "Service_3", "Amount_3",
     "total_amount", "gst", "total",
     "Amount_In_Words", "Email", "Phone", "Trigger",
+    "Invoice_Type",
 ]
+
+# Invoice types. A client's first invoice is a Proforma; every later one is a
+# Tax Invoice. Both share one number series - the type only travels in the
+# webhook payload (and the Invoice_Type column) for Make to pick the template.
+PROFORMA = "Proforma Invoice"
+TAX_INVOICE = "Tax Invoice"
+INVOICE_TYPES = [PROFORMA, TAX_INVOICE]
 
 # Computed values the sheet has no column for. Sent flat in the payload anyway,
 # so they can be mapped in Make the day you add columns for them.
@@ -678,6 +686,21 @@ def next_invoice_no(
     return f"{prefix}/{fy}/{max(seq, min_seq) + 1:03d}"
 
 
+def client_has_history(client_gst: str) -> bool:
+    """True if any invoice (proforma or tax) was already raised on this GSTIN."""
+    gst = (client_gst or "").strip().upper()
+    if len(gst) != 15:
+        return False
+    df = load_data()
+    if df.empty or "Client_GST" not in df.columns:
+        return False
+    return gst in set(df["Client_GST"].astype(str).str.strip().str.upper())
+
+
+def suggested_type(client_gst: str) -> str:
+    return TAX_INVOICE if client_has_history(client_gst) else PROFORMA
+
+
 # ----------------------------------------------------------------------------
 # BRANDING
 # ----------------------------------------------------------------------------
@@ -966,7 +989,7 @@ with st.sidebar:
         help="Same state as client -> CGST + SGST. Different state -> IGST.",
     )
     gst_rate = st.number_input("GST rate (%)", 0.0, 28.0, 18.0, step=0.5)
-    inv_prefix = st.text_input("Invoice prefix", value="DP")
+    inv_prefix = st.text_input("Invoice prefix", value="DP").strip()
     reset_each_fy = st.toggle(
         "Restart numbering each financial year",
         value=False,
@@ -1063,14 +1086,50 @@ with tab_entry:
     # Anything that writes widget state must run before those widgets exist,
     # hence the flag-then-rerun pattern used throughout this block.
     if st.session_state.pop("_advance_invoice", False):
-        ref_date = st.session_state.get("inv_date", dt.date.today())
-        st.session_state["invoice_no"] = next_invoice_no(
-            inv_prefix, ref_date, reset_each_fy, min_seq
-        )
+        # Drop the number; it is re-filled below with the next in sequence.
+        st.session_state.pop("invoice_no", None)
 
     flash = st.session_state.pop("_flash", None)
     if flash:
         st.success(flash)
+
+    # ---- invoice type ----
+    # Suggested from the client's GSTIN: no earlier invoice -> Proforma,
+    # otherwise Tax Invoice. The GST field sits further down the form, but
+    # its value is already in session state when this runs.
+    _gst_now = str(st.session_state.get("client_gst", "")).strip().upper()
+    suggestion = suggested_type(_gst_now)
+    prev_suggestion = st.session_state.get("_last_type_suggestion")
+    if "inv_type" not in st.session_state:
+        st.session_state["inv_type"] = suggestion
+    elif prev_suggestion is not None and prev_suggestion != suggestion \
+            and st.session_state["inv_type"] == prev_suggestion:
+        # Follow the suggestion unless the user picked a type by hand.
+        st.session_state["inv_type"] = suggestion
+    st.session_state["_last_type_suggestion"] = suggestion
+
+    t1, t2 = st.columns([1, 2], vertical_alignment="center")
+    with t1:
+        invoice_type = st.radio(
+            "Invoice type",
+            INVOICE_TYPES,
+            key="inv_type",
+            horizontal=True,
+            help="First invoice for a client = Proforma. Every invoice after "
+                 "that = Tax Invoice. Picked automatically from the Client "
+                 "GST; you can override it.",
+        )
+    with t2:
+        if len(_gst_now) == 15:
+            if suggestion == TAX_INVOICE:
+                st.caption(f"✅ {_gst_now} has invoices on record → **Tax Invoice**.")
+            else:
+                st.caption(f"🆕 First invoice for {_gst_now} → **Proforma Invoice**.")
+        else:
+            st.caption("Enter the Client GST below and the type is picked "
+                       "automatically (new client → Proforma).")
+        if invoice_type != suggestion and len(_gst_now) == 15:
+            st.caption(f"⚠️ Overridden — suggested type is {suggestion}.")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -1120,6 +1179,7 @@ with tab_entry:
         )
         client_gst = st.text_input(
             "Client GST *",
+            key="client_gst",
             placeholder=f"{gst_code}ABCDE1234F1Z5",
             help="Mandatory. 15-character GSTIN.",
         ).strip().upper()
@@ -1288,7 +1348,7 @@ with tab_entry:
     for w in warnings:
         st.warning(w)
 
-    if st.button("💾 Save invoice", type="primary", width="stretch"):
+    if st.button(f"💾 Save {invoice_type.lower()}", type="primary", width="stretch"):
         if errors:
             for e in errors:
                 st.error(e)
@@ -1315,6 +1375,7 @@ with tab_entry:
                 "Email": email.strip(),
                 "Phone": phone.strip(),
                 "Trigger": trigger_value,
+                "Invoice_Type": invoice_type,
                 # Not columns in the sheet, but sent so Make can map them if
                 # you add columns later.
                 "Timestamp": now_ist().strftime(TS_FORMAT),
@@ -1432,16 +1493,21 @@ with tab_records:
             }
         )
 
-        first_cols = ["Created Date", "Created Time", "Invoice_No", "Client_Name"]
+        # Rows saved before invoice types existed are tax invoices.
+        df["Invoice_Type"] = df["Invoice_Type"].replace("", TAX_INVOICE)
+        first_cols = ["Created Date", "Created Time", "Invoice_Type",
+                      "Invoice_No", "Client_Name"]
         hidden = {"_ts", "_pos"}
         ordered = first_cols + [
             c for c in df.columns if c not in first_cols and c not in hidden
         ]
 
-        top = st.columns([4, 1], vertical_alignment="bottom")
+        top = st.columns([3, 1.3, 1], vertical_alignment="bottom")
         with top[0]:
             q = st.text_input("Search billing name / invoice no / GST")
         with top[1]:
+            type_filter = st.selectbox("Type", ["All"] + INVOICE_TYPES)
+        with top[2]:
             if st.button("↻ Refresh", width="stretch"):
                 refresh_store()
                 st.rerun()
@@ -1454,6 +1520,8 @@ with tab_records:
                 | df["Client_GST"].str.contains(q, case=False, na=False)
             )
             view = df[mask]
+        if type_filter != "All":
+            view = view[view["Invoice_Type"] == type_filter]
 
         # Newest first: by creation time, then by file position for same-second
         # saves. Rows with an unparseable Timestamp sink to the bottom.
